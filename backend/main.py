@@ -1,17 +1,41 @@
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
+from fastapi.security import OAuth2PasswordBearer
+from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine
 import models, schemas
+from fastapi.staticfiles import StaticFiles
+import os
+import shutil
 from database import SessionLocal, engine
+import secrets
+import smtplib
+import requests
 from yookassa import Configuration, Payment
 from yookassa.domain.request import PaymentRequest
 import uuid
+# Добавьте в начало файла
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+
+SECRET_KEY = "your-secret-key"  # В продакшене используйте сложный ключ
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
 # Настройка ЮKassa (замените на ваши данные)
 Configuration.account_id = "your_shop_id"
 Configuration.secret_key = "your_secret_key"
 
 app = FastAPI()
+os.makedirs("uploads", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 def get_db():
     db = SessionLocal()
@@ -19,6 +43,180 @@ def get_db():
         yield db
     finally:
         db.close()
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.yandex.ru")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 465))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+SMS_API_KEY = os.getenv("SMS_API_KEY")
+SMS_SENDER = "SakhShop"
+
+class UserRegister(BaseModel):
+    inn: str
+    email: EmailStr
+    phone: str
+    name: str
+    is_seller: bool
+
+class VerifyEmailRequest(BaseModel):
+    token: str
+
+class UserLogin(BaseModel):
+    inn: str
+    password: str
+
+def send_verification_email(email: str, token: str):
+    verification_url = f"https://sakhshop.ru/verify-email?token={token}"
+    message = MIMEText(
+        f"Для подтверждения email перейдите по ссылке: {verification_url}"
+    )
+    message["Subject"] = "Подтверждение email в SakhShop"
+    message["From"] = SMTP_USER
+    message["To"] = email
+    
+    try:
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_USER, [email], message.as_string())
+    except Exception as e:
+        print(f"Ошибка отправки email: {e}")
+
+def send_sms(phone: str, message: str):
+    try:
+        response = requests.post(
+            "https://sms.ru/sms/send",
+            data={
+                "api_id": SMS_API_KEY,
+                "to": phone,
+                "msg": message,
+                "json": 1,
+                "from": SMS_SENDER
+            }
+        )
+        return response.json()
+    except Exception as e:
+        print(f"Ошибка отправки SMS: {e}")
+        return None
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    try:
+        # Генерируем уникальное имя файла
+        file_ext = os.path.splitext(file.filename)[1]
+        unique_filename = f"{secrets.token_hex(8)}{file_ext}"
+        file_path = os.path.join("uploads", unique_filename)
+        
+        # Сохраняем файл
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        return {"filename": unique_filename}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/auth/register")
+async def register(user: UserRegister, db: Session = Depends(get_db)):
+    # Проверка ИНН в зависимости от типа пользователя
+    if user.is_seller and len(user.inn) != 10:
+        raise HTTPException(status_code=400, detail="ИНН юрлица должен содержать 10 цифр")
+    elif not user.is_seller and len(user.inn) != 12:
+        raise HTTPException(status_code=400, detail="ИНН физлица должен содержать 12 цифр")
+    
+    # Проверка, что пользователь с таким ИНН не существует
+    db_user = db.query(models.User).filter(models.User.inn == user.inn).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Пользователь с таким ИНН уже зарегистрирован")
+    
+    # Генерация токена подтверждения
+    verify_token = secrets.token_urlsafe(32)
+    
+    # Сохранение пользователя в БД (пример)
+    db_user = models.User(
+        inn=user.inn,
+        email=user.email,
+        phone=user.phone,
+        name=user.name,
+        is_seller=user.is_seller,
+        email_verified=False,
+        verification_token=verify_token
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    
+    # Отправка email с подтверждением
+    send_verification_email(user.email, verify_token)
+    
+    return {"message": "На ваш email отправлено письмо с подтверждением"}
+
+def send_verification_email(email: str, token: str):
+    verification_url = f"https://sakhshop.ru/verify-email?token={token}"
+    message = MIMEText(
+        f"Для подтверждения email перейдите по ссылке: {verification_url}"
+    )
+    message["Subject"] = "Подтверждение email в SakhShop"
+    message["From"] = SMTP_USER
+    message["To"] = email
+    
+    try:
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_USER, [email], message.as_string())
+    except Exception as e:
+        print(f"Ошибка отправки email: {e}")
+
+@app.post("/api/auth/verify-email")
+async def verify_email(request: VerifyEmailRequest, db: Session = Depends(get_db)):
+    # Находим пользователя по токену
+    db_user = db.query(models.User).filter(
+        models.User.verification_token == request.token
+    ).first()
+    
+    if not db_user:
+        raise HTTPException(status_code=404, detail="Неверный токен подтверждения")
+    
+    # Обновляем статус подтверждения
+    db_user.email_verified = True
+    db_user.verification_token = None
+    db.commit()
+    
+    return {"message": "Email успешно подтверждён"}
+
+@app.post("/api/auth/login")
+async def login(user: UserLogin, db: Session = Depends(get_db)):
+    # Находим пользователя по ИНН
+    db_user = db.query(models.User).filter(models.User.inn == user.inn).first()
+    
+    if not db_user or not db_user.email_verified:
+        raise HTTPException(status_code=401, detail="Неверные учетные данные или email не подтвержден")
+    
+    # Здесь должна быть проверка пароля (пока пропущена для простоты)
+    # Генерация JWT токена (упрощенный пример)
+    token_data = {
+        "sub": db_user.inn,
+        "role": "seller" if db_user.is_seller else "buyer"
+    }
+    # В реальном приложении используйте библиотеку для JWT
+    
+    return {"token": "generated-jwt-token", "role": "seller" if db_user.is_seller else "buyer"}
+
+@app.get("/api/users/me")
+async def read_users_me(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    # В реальном приложении здесь должна быть проверка JWT токена
+    # Для примера просто возвращаем данные первого пользователя
+    db_user = db.query(models.User).first()
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {
+        "inn": db_user.inn,
+        "email": db_user.email,
+        "name": db_user.name,
+        "is_seller": db_user.is_seller,
+        "email_verified": db_user.email_verified
+    }
+
 
 @app.post("/users/", response_model=schemas.UserResponse)
 def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
@@ -105,3 +303,32 @@ def confirm_transaction(transaction_id: int, db: Session = Depends(get_db)):
     db_order.status = models.OrderStatus.DELIVERED
     db.commit()
     return {"status": "confirmed"}
+
+import requests
+
+SMS_API_KEY = os.getenv("SMS_API_KEY")
+SMS_SENDER = "SakhShop"
+
+def send_sms(phone: str, message: str):
+    try:
+        response = requests.post(
+            "https://sms.ru/sms/send",
+            data={
+                "api_id": SMS_API_KEY,
+                "to": phone,
+                "msg": message,
+                "json": 1,
+                "from": SMS_SENDER
+            }
+        )
+        return response.json()
+    except Exception as e:
+        print(f"Ошибка отправки SMS: {e}")
+        return None
+
+# Использование:
+@app.post("/api/auth/send-verification-sms")
+async def send_verification_sms(phone: str):
+    code = secrets.randbelow(9000) + 1000  # 4-значный код
+    send_sms(phone, f"Ваш код подтверждения: {code}")
+    return {"message": "SMS отправлено", "code": str(code)}  # В продакшене не возвращайте код!

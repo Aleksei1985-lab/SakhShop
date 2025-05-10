@@ -30,6 +30,6 @@ services:
         condition: service_healthy
     volumes:
       - ../backend:/app
-
+      - ./backend/uploads:/app/uploads
 volumes:
   postgres_data:
