@@ -1,41 +1,69 @@
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
-from sqlalchemy.orm import Session
-from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel, EmailStr
-from sqlalchemy import create_engine
-import models, schemas
-from fastapi.staticfiles import StaticFiles
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from datetime import datetime, timedelta
+from typing import Annotated
 import os
-import shutil
-from database import SessionLocal, engine
 import secrets
 import smtplib
+from email.mime.text import MIMEText
 import requests
+from pydantic import BaseModel, EmailStr
+from sqlalchemy.orm import Session
+import models, schemas
+from database import SessionLocal, engine
+from fastapi.staticfiles import StaticFiles
+import shutil
 from yookassa import Configuration, Payment
 from yookassa.domain.request import PaymentRequest
 import uuid
-# Добавьте в начало файла
-from jose import JWTError, jwt
-from datetime import datetime, timedelta
 
-SECRET_KEY = "your-secret-key"  # В продакшене используйте сложный ключ
+SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-def create_access_token(data: dict):
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Настройка ЮKassa
+Configuration.account_id = os.getenv("YOOKASSA_SHOP_ID")
+Configuration.secret_key = os.getenv("YOOKASSA_SECRET_KEY")
+
+app = FastAPI()
+
+os.makedirs("uploads", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+# Модели для аутентификации
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    inn: str | None = None
+
+class UserInDB(BaseModel):
+    inn: str
+    email: str
+    phone: str
+    name: str
+    is_seller: bool
+    hashed_password: str
+    email_verified: bool
+
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-# Настройка ЮKassa (замените на ваши данные)
-Configuration.account_id = "your_shop_id"
-Configuration.secret_key = "your_secret_key"
 
-app = FastAPI()
-os.makedirs("uploads", exist_ok=True)
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
 
 def get_db():
     db = SessionLocal()
@@ -43,6 +71,7 @@ def get_db():
         yield db
     finally:
         db.close()
+
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.yandex.ru")
@@ -183,6 +212,33 @@ async def verify_email(request: VerifyEmailRequest, db: Session = Depends(get_db
     
     return {"message": "Email успешно подтверждён"}
 
+def verify_password(plain_password: str, hashed_password: str):
+    return pwd_context.verify(plain_password, hashed_password)
+
+@app.post("/token", response_model=Token)
+async def login_for_access_token(
+    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
+    db: Session = Depends(get_db)
+):
+    user = db.query(models.User).filter(models.User.inn == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect inn or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not user.email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email not verified"
+        )
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.inn}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
 @app.post("/api/auth/login")
 async def login(user: UserLogin, db: Session = Depends(get_db)):
     # Находим пользователя по ИНН
@@ -201,29 +257,66 @@ async def login(user: UserLogin, db: Session = Depends(get_db)):
     
     return {"token": "generated-jwt-token", "role": "seller" if db_user.is_seller else "buyer"}
 
-@app.get("/api/users/me")
-async def read_users_me(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    # В реальном приложении здесь должна быть проверка JWT токена
-    # Для примера просто возвращаем данные первого пользователя
-    db_user = db.query(models.User).first()
-    if not db_user:
-        raise HTTPException(status_code=404, detail="User not found")
+async def get_current_user(
+    token: Annotated[str, Depends(oauth2_scheme)],
+    db: Session = Depends(get_db)
+):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        inn: str = payload.get("sub")
+        if inn is None:
+            raise credentials_exception
+        token_data = TokenData(inn=inn)
+    except JWTError:
+        raise credentials_exception
     
-    return {
-        "inn": db_user.inn,
-        "email": db_user.email,
-        "name": db_user.name,
-        "is_seller": db_user.is_seller,
-        "email_verified": db_user.email_verified
-    }
+    user = db.query(models.User).filter(models.User.inn == token_data.inn).first()
+    if user is None:
+        raise credentials_exception
+    return user
 
+async def get_current_active_user(
+    current_user: Annotated[models.User, Depends(get_current_user)]
+):
+    if not current_user.email_verified:
+        raise HTTPException(status_code=400, detail="Email not verified")
+    return current_user
+
+@app.get("/users/me/", response_model=schemas.UserResponse)
+async def read_users_me(
+    current_user: Annotated[models.User, Depends(get_current_active_user)]
+):
+    return current_user
+
+def get_password_hash(password: str):
+    return pwd_context.hash(password)
 
 @app.post("/users/", response_model=schemas.UserResponse)
-def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
+def create_user(
+    user: schemas.UserCreate, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_active_user)
+):
+    # Только администратор может создавать пользователей
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Only admin can create users")
+    
     db_user = db.query(models.User).filter(models.User.inn == user.inn).first()
     if db_user:
         raise HTTPException(status_code=400, detail="User already registered")
-    db_user = models.User(inn=user.inn, is_seller=user.is_seller)
+    
+    hashed_password = get_password_hash(user.password)
+    db_user = models.User(
+        inn=user.inn,
+        email=user.email,
+        hashed_password=hashed_password,
+        is_seller=user.is_seller
+    )
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
@@ -325,10 +418,35 @@ def send_sms(phone: str, message: str):
     except Exception as e:
         print(f"Ошибка отправки SMS: {e}")
         return None
+    
+def send_sms_secure(phone: str, message: str):
+    try:
+        # В продакшене используйте HTTPS
+        response = requests.post(
+            "https://sms.ru/sms/send",
+            data={
+                "api_id": os.getenv("SMS_API_KEY"),
+                "to": phone,
+                "msg": message,
+                "json": 1,
+                "from": "SakhShop"
+            },
+            timeout=5  # Таймаут для безопасности
+        )
+        return response.status_code == 200
+    except Exception as e:
+        print(f"SMS sending error: {e}")
+        return False
 
-# Использование:
 @app.post("/api/auth/send-verification-sms")
-async def send_verification_sms(phone: str):
-    code = secrets.randbelow(9000) + 1000  # 4-значный код
-    send_sms(phone, f"Ваш код подтверждения: {code}")
-    return {"message": "SMS отправлено", "code": str(code)}  # В продакшене не возвращайте код!
+async def send_verification_sms(
+    phone: str,
+    current_user: models.User = Depends(get_current_active_user)
+):
+    code = secrets.randbelow(9000) + 1000
+    if send_sms_secure(phone, f"Ваш код подтверждения: {code}"):
+        # Сохраняем код в БД (без возврата клиенту)
+        current_user.sms_code = str(code)
+        db.commit()
+        return {"message": "SMS отправлено"}
+    raise HTTPException(status_code=500, detail="Ошибка отправки SMS")
