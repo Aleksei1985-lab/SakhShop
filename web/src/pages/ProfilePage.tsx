@@ -3,16 +3,26 @@ import {
   Container, Typography, Box, Avatar, TextField, 
   Button, CircularProgress, Alert 
 } from '@mui/material';
-import { useAuth } from '../hooks/useAuth';
+import useAuth from '../hooks/useAuth';
 import axios from 'axios';
+
+// Явно определяем тип профиля
+interface UserProfile {
+  email: string;
+  phone: string;
+  name: string;
+  avatar: string;
+  email_verified: boolean; // Добавляем обязательное поле
+}
 
 const ProfilePage = () => {
   const { userInn, userRole, logout } = useAuth();
-  const [profile, setProfile] = useState({
+  const [profile, setProfile] = useState<UserProfile>({
     email: '',
     phone: '',
     name: '',
-    avatar: ''
+    avatar: '',
+    email_verified: false // Инициализируем значение
   });
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState('');
@@ -20,7 +30,7 @@ const ProfilePage = () => {
   useEffect(() => {
     const fetchProfile = async () => {
       try {
-        const response = await axios.get('/api/user/profile');
+        const response = await axios.get<UserProfile>('/api/user/profile'); // Указываем тип ответа
         setProfile(response.data);
       } catch (err) {
         setError('Ошибка загрузки профиля');

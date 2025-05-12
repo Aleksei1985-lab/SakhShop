@@ -1,5 +1,5 @@
 import { Typography, Container } from '@mui/material';
-import { useAuth } from '../hooks/useAuth';
+import useAuth from '../hooks/useAuth';
 
 const HomePage = () => {
   const { isAuthenticated } = useAuth();

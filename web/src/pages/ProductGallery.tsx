@@ -1,5 +1,13 @@
-import { Grid, Container, Typography, Card, CardMedia, CardContent, Chip } from '@mui/material';
 import { useTheme } from '@mui/material/styles';
+import { 
+  Container, 
+  Typography, 
+  Card, 
+  CardContent, 
+  CardMedia, 
+  Chip,
+  Grid
+} from '@mui/material';
 import { products } from '../data/mockProducts';
 
 const ProductGallery = () => {
@@ -17,15 +25,22 @@ const ProductGallery = () => {
       
       <Grid container spacing={4}>
         {products.map((product) => (
-          <Grid item key={product.id} xs={12} sm={6} md={4} lg={3}>
+          <Grid 
+            key={product.id}
+            item
+            xs={12}
+            sm={6}
+            md={4}
+            lg={3}
+          >
             <Card sx={{ 
-              height: '100%',
-              display: 'flex',
+              height: '100%', 
+              display: 'flex', 
               flexDirection: 'column',
-              transition: 'transform 0.3s ease',
               '&:hover': {
-                transform: 'translateY(-8px)',
-                boxShadow: 6
+                boxShadow: 6,
+                transform: 'translateY(-4px)',
+                transition: 'all 0.3s ease'
               }
             }}>
               <CardMedia

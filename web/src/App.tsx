@@ -1,6 +1,5 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import ProtectedRoute from './components/ProtectedRoute';
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import { CssBaseline } from '@mui/material';
 import { ThemeProvider } from './context/ThemeContext';
 import NavBar from './components/NavBar';
@@ -10,6 +9,8 @@ import RegisterPage from './pages/RegisterPage';
 import SellerDashboard from './pages/SellerDashboard';
 import ProductGallery from './pages/ProductGallery';
 import VerifyEmail from './pages/VerifyEmail';
+import ProfilePage from './pages/ProfilePage';
+import SellerProducts from './pages/SellerProducts';
 
 function App() {
   return (

@@ -8,7 +8,16 @@ interface UserData {
   inn: string;
 }
 
-const useAuth = () => {
+interface AuthContextType {
+  isAuthenticated: boolean;
+  userRole: 'buyer' | 'seller';
+  userInn: string;
+  login: (inn: string, password: string) => Promise<void>;
+  register: (inn: string, isSeller: boolean) => Promise<void>;
+  logout: () => void;
+}
+
+const useAuth = (): AuthContextType => {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [userRole, setUserRole] = useState<'buyer' | 'seller'>('buyer');
   const [userInn, setUserInn] = useState('');
@@ -30,7 +39,7 @@ const useAuth = () => {
 
   const register = async (inn: string, isSeller: boolean) => {
     try {
-      const response = await axios.post<{ message: string }>('/api/auth/register', { 
+      await axios.post('/api/auth/register', { 
         inn, 
         is_seller: isSeller 
       });
