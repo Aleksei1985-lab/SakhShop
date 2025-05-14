@@ -18,10 +18,10 @@ from email.mime.text import MIMEText
 import requests
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
-from models import User, Service, Item, Order 
-from database import Base, SessionLocal, engine
-from schemas import UserCreate, UserResponse
-from utils import get_password_hash
+from .models import User, Service, Item, Order 
+from .database import Base, SessionLocal, engine
+from .schemas import UserCreate, UserResponse
+from .utils import get_password_hash, create_access_token, create_refresh_token, send_verification_email
 from fastapi.staticfiles import StaticFiles
 import shutil
 from yookassa import Configuration, Payment
@@ -30,7 +30,7 @@ import uuid
 from redis.asyncio import Redis
 import logging
 from logging.config import dictConfig
-from config import LogConfig, settings
+from .config import LogConfig, settings
 from geopy.distance import geodesic
 
 # Настройка логгирования
@@ -71,7 +71,7 @@ def get_db():
 
 redis_connection = Redis(host="localhost", port=6379, decode_responses=True)
 # Настройка rate limiting
-@app.lifespan.on_startup
+@app.on_event("startup")
 async def startup():
     await FastAPILimiter.init(redis_connection)
 
@@ -84,7 +84,6 @@ auth_router = APIRouter(prefix="/api/auth", tags=["auth"])
 users_router = APIRouter(prefix="/api/users", tags=["users"])
 payments_router = APIRouter(prefix="/api/payments", tags=["payments"])
 files_router = APIRouter(prefix="/api/files", tags=["files"])
-# Добавьте в main.py
 mobile_router = APIRouter(prefix="/api/mobile", tags=["mobile"])
 
 @mobile_router.get("/products")
@@ -154,22 +153,6 @@ def verify_phone_number(phone: str) -> bool:
     except:
         return False
 
-def send_verification_email(email: str, verification_code: str):
-    try:
-        msg = MIMEText(f"Ваш код верификации: {verification_code}")
-        msg["Subject"] = "Верификация email для Sakhshop"
-        msg["From"] = settings.SMTP_USER
-        msg["To"] = email
-
-        with smtplib.SMTP_SSL(settings.SMTP_SERVER, settings.SMTP_PORT) as server:
-            server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
-            server.send_message(msg)
-        print(f"Email успешно отправлен на {email}")
-        return True
-    except Exception as e:
-        print(f"Ошибка отправки email: {str(e)}")
-        return False
-
 # Эндпоинты аутентификации
 @app.post("/api/auth/register", response_model=UserResponse)
 async def register_user(user: UserCreate, db: Session = Depends(get_db)):
@@ -182,13 +165,16 @@ async def register_user(user: UserCreate, db: Session = Depends(get_db)):
             raise HTTPException(status_code=400, detail="Email уже зарегистрирован")
 
         hashed_password = get_password_hash(user.password)
+        verification_token = secrets.token_urlsafe(32)
         db_user = User(
             inn=user.inn,
             email=user.email,
             phone=user.phone,
             name=user.name,
             hashed_password=hashed_password,
-            is_seller=user.is_seller
+            is_seller=user.is_seller,
+            verification_token=verification_token,
+            verification_token_expires=datetime.utcnow() + timedelta(hours=24)
         )
         db.add(db_user)
         db.commit()
@@ -209,9 +195,26 @@ async def register_user(user: UserCreate, db: Session = Depends(get_db)):
         print(f"Ошибка при регистрации пользователя: {str(e)}")
         raise HTTPException(status_code=500, detail="Ошибка при регистрации пользователя")
     
-@payments_router.post("/create-payment")
+@auth_router.post("/verify-email")
+async def verify_email(request: VerifyEmailRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.verification_token == request.token).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="Неверный или устаревший токен")
+    
+    if user.verification_token_expires < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Токен истек")
+
+    user.email_verified = True
+    user.verification_token = None
+    user.verification_token_expires = None
+    db.commit()
+    
+    return {"message": "Email успешно подтвержден"}
+
 async def create_payment(order_id: int, db: Session = Depends(get_db)):
     order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
     
     payment = Payment.create({
         "amount": {
@@ -226,7 +229,7 @@ async def create_payment(order_id: int, db: Session = Depends(get_db)):
         "description": f"Заказ №{order.id}"
     }, uuid.uuid4())
     
-    db.payment_id = payment.id
+    order.payment_id = payment.id
     db.commit()
     
     return {"confirmation_url": payment.confirmation.confirmation_url}
@@ -271,7 +274,7 @@ async def login(user: UserLogin, db: Session = Depends(get_db)):
 async def search_nearby(
     lat: float, 
     lon: float, 
-    radius: int = 10,  # радиус в км
+    radius: int = 10,
     db: Session = Depends(get_db)
 ):
     products = db.query(Item).all()
@@ -285,6 +288,7 @@ async def search_nearby(
             nearby_results.append(item)
     
     return nearby_results
+
 
 @auth_router.post("/refresh", response_model=Token)
 async def refresh_token(token: RefreshTokenRequest):

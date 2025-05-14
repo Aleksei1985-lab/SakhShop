@@ -10,6 +10,7 @@ from jose import jwt
 from typing import Optional
 from fastapi import HTTPException, status
 import logging
+from .config import settings
 
 logger = logging.getLogger("sakhshop")
 
@@ -22,7 +23,7 @@ SMS_API_KEY = os.getenv("SMS_API_KEY")
 SMS_SENDER = "SakhShop"
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
 REFRESH_SECRET_KEY = os.getenv("REFRESH_SECRET_KEY", secrets.token_urlsafe(32))
-ALGORITHM = "HS256"
+ALGORITHM = settings.ALGORITHM
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -32,21 +33,23 @@ def send_verification_email(email: str, token: str):
         f"Для подтверждения email перейдите по ссылке: {verification_url}"
     )
     message["Subject"] = "Подтверждение email в SakhShop"
-    message["From"] = SMTP_USER
+    message["From"] = settings.SMTP_USER
     message["To"] = email
     
     try:
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(SMTP_USER, [email], message.as_string())
+        with smtplib.SMTP_SSL(settings.SMTP_SERVER, settings.SMTP_PORT) as server:
+            server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+            server.sendmail(settings.SMTP_USER, [email], message.as_string())
+        logger.info(f"Email успешно отправлен на {email}")
+        return True
     except Exception as e:
         logger.error(f"Ошибка отправки email: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Ошибка отправки email"
-        )
+        return False
 
 def send_sms_secure(phone: str, message: str) -> bool:
+    if not SMS_API_KEY:
+        logger.error("SMS_API_KEY не настроен")
+        return False
     try:
         response = requests.post(
             "https://sms.ru/sms/send",
