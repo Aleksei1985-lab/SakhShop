@@ -2,7 +2,7 @@
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Float, Enum
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSON 
-from .database import Base
+from database import Base
 import enum
 from datetime import datetime
 

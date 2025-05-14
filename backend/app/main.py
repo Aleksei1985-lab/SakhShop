@@ -18,8 +18,10 @@ from email.mime.text import MIMEText
 import requests
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
-from .models import User, Service, Item, Order 
-from .database import Base, SessionLocal, engine
+from models import User, Service, Item, Order 
+from database import Base, SessionLocal, engine
+from schemas import UserCreate, UserResponse
+from utils import get_password_hash
 from fastapi.staticfiles import StaticFiles
 import shutil
 from yookassa import Configuration, Payment
@@ -28,8 +30,8 @@ import uuid
 from redis.asyncio import Redis
 import logging
 from logging.config import dictConfig
-from .config import LogConfig
-
+from config import LogConfig, settings
+from geopy.distance import geodesic
 
 # Настройка логгирования
 dictConfig(LogConfig().dict())
@@ -69,7 +71,7 @@ def get_db():
 
 redis_connection = Redis(host="localhost", port=6379, decode_responses=True)
 # Настройка rate limiting
-@app.on_event("startup")
+@app.lifespan.on_startup
 async def startup():
     await FastAPILimiter.init(redis_connection)
 
@@ -152,93 +154,60 @@ def verify_phone_number(phone: str) -> bool:
     except:
         return False
 
-def send_verification_email(email: str, token: str):
-    verification_url = f"https://sakhshop.ru/verify-email?token={token}"
-    message = MIMEText(
-        f"Для подтверждения email перейдите по ссылке: {verification_url}"
-    )
-    message["Subject"] = "Подтверждение email в SakhShop"
-    message["From"] = os.getenv("SMTP_USER", "noreply@sakhshop.ru")
-    message["To"] = email
-    
+def send_verification_email(email: str, verification_code: str):
     try:
-        with smtplib.SMTP_SSL(
-            os.getenv("SMTP_SERVER", "smtp.yandex.ru"),
-            int(os.getenv("SMTP_PORT", 465))
-        ) as server:
-            server.login(
-                os.getenv("SMTP_USER"),
-                os.getenv("SMTP_PASSWORD")
-            )
-            server.sendmail(os.getenv("SMTP_USER"), [email], message.as_string())
+        msg = MIMEText(f"Ваш код верификации: {verification_code}")
+        msg["Subject"] = "Верификация email для Sakhshop"
+        msg["From"] = settings.SMTP_USER
+        msg["To"] = email
+
+        with smtplib.SMTP_SSL(settings.SMTP_SERVER, settings.SMTP_PORT) as server:
+            server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+            server.send_message(msg)
+        print(f"Email успешно отправлен на {email}")
+        return True
     except Exception as e:
-        logger.error(f"Ошибка отправки email: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Ошибка отправки email"
-        )
+        print(f"Ошибка отправки email: {str(e)}")
+        return False
 
 # Эндпоинты аутентификации
-@auth_router.post("/register", status_code=status.HTTP_201_CREATED)
-async def register(user: UserRegister, db: Session = Depends(get_db)):
-    # Проверка ИНН
-    if user.is_seller and len(user.inn) != 10:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="ИНН юрлица должен содержать 10 цифр"
-        )
-    elif not user.is_seller and len(user.inn) != 12:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="ИНН физлица должен содержать 12 цифр"
-        )
-    
-    # Проверка телефона
-    if not verify_phone_number(user.phone):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Неверный формат номера телефона"
-        )
-    
-    # Проверка существования пользователя
-    if db.query(User).filter(User.inn == user.inn).first():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Пользователь с таким ИНН уже зарегистрирован"
-        )
-    
-    # Хеширование пароля
-    hashed_password = pwd_context.hash(user.password)
-    verify_token = secrets.token_urlsafe(32)
-    
-    # Создание пользователя
-    db_user = User(
-        inn=user.inn,
-        email=user.email,
-        phone=user.phone,
-        name=user.name,
-        is_seller=user.is_seller,
-        hashed_password=hashed_password,
-        email_verified=False,
-        verification_token=verify_token
-    )
-    
+@app.post("/api/auth/register", response_model=UserResponse)
+async def register_user(user: UserCreate, db: Session = Depends(get_db)):
     try:
+        if len(user.inn) not in (10, 12):
+            raise HTTPException(status_code=400, detail="ИНН должен содержать 10 или 12 цифр")
+        if db.query(User).filter(User.inn == user.inn).first():
+            raise HTTPException(status_code=400, detail="Пользователь с таким ИНН уже существует")
+        if db.query(User).filter(User.email == user.email).first():
+            raise HTTPException(status_code=400, detail="Email уже зарегистрирован")
+
+        hashed_password = get_password_hash(user.password)
+        db_user = User(
+            inn=user.inn,
+            email=user.email,
+            phone=user.phone,
+            name=user.name,
+            hashed_password=hashed_password,
+            is_seller=user.is_seller
+        )
         db.add(db_user)
         db.commit()
         db.refresh(db_user)
-        
-        # Отправка email с подтверждением
-        send_verification_email(user.email, verify_token)
-        
-        return {"message": "На ваш email отправлено письмо с подтверждением"}
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Ошибка при регистрации пользователя: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Ошибка при регистрации пользователя"
+
+        # Отправка email (не прерывает регистрацию при ошибке)
+        verification_code = "123456"  # В реальном проекте генерируй случайный код
+        if not send_verification_email(db_user.email, verification_code):
+            print("Предупреждение: Не удалось отправить email верификации")
+
+        access_token = create_access_token(
+            data={"sub": db_user.inn},
+            expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
         )
+
+        return db_user
+    except Exception as e:
+        print(f"Ошибка при регистрации пользователя: {str(e)}")
+        raise HTTPException(status_code=500, detail="Ошибка при регистрации пользователя")
     
 @payments_router.post("/create-payment")
 async def create_payment(order_id: int, db: Session = Depends(get_db)):
